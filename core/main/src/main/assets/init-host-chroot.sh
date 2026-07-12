@@ -64,6 +64,12 @@ if [ -e "$PREFIX/local/vmstat" ]; then
     $SU -c "cp '$PREFIX/local/vmstat' '$ALPINE_DIR/proc/vmstat'" 2>/dev/null
 fi
 
+$SU -c "mkdir -p '$ALPINE_DIR/dev/pts'"
+$SU -c "mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts '$ALPINE_DIR/dev/pts'"
+MOUNTS="$MOUNTS $ALPINE_DIR/dev/pts"
+$SU -c "rm -f '$ALPINE_DIR/dev/ptmx'"
+$SU -c "ln -s pts/ptmx '$ALPINE_DIR/dev/ptmx'"
+
 cleanup() {
     for m in $MOUNTS; do
         $SU -c "umount -l '$m'" 2>/dev/null
