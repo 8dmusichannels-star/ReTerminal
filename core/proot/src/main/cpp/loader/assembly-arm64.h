@@ -39,7 +39,7 @@
 		"br %1				\n"		\
 		: /* no output */				\
 		: "r" (stack_pointer), "r" (destination)	\
-		: "memory", "x0");			\
+		: "memory", "sp", "x0");			\
 	__builtin_unreachable();				\
 	} while (0)
 

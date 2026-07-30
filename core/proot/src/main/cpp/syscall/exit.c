@@ -77,16 +77,8 @@ void translate_syscall_exit(Tracee *tracee)
 
 	/* If proot changed syscall to PR_void during enter,
 	 * keep syscall result set during entry. */
-	if (peek_reg(tracee, MODIFIED, SYSARG_NUM) ==
-#if defined(ARCH_ARM64) || defined(ARCH_X86_64)
-			(is_32on64_mode(tracee) ? (SYSCALL_AVOIDER & 0xFFFFFFFF) : SYSCALL_AVOIDER)
-#else
-			SYSCALL_AVOIDER
-#endif
-			&&
-			peek_reg(tracee, ORIGINAL, SYSARG_NUM) != peek_reg(tracee, MODIFIED, SYSARG_NUM)) {
+	if (is_voided_syscall(tracee, MODIFIED))
 		poke_reg(tracee, SYSARG_RESULT, peek_reg(tracee, MODIFIED, SYSARG_RESULT));
-	}
 
 	/* Translate output arguments:
 	 * - break: update the syscall result register with "status"
@@ -722,17 +714,50 @@ void translate_syscall_exit(Tracee *tracee)
 					/* Avoid duplicates.  */
 					bool present = false;
 					for (i = 0; i < tracee->fake_netlink_fds_count; i++) {
-						if (tracee->fake_netlink_fds[i] == fd) {
+						if (tracee->fake_netlink_fds[i].fd == fd) {
+							present = true;
+							break;
+						}
+					}
+					if (!present) {
+						struct fake_netlink_socket *sock =
+							&tracee->fake_netlink_fds[tracee->fake_netlink_fds_count++];
+						memset(sock, 0, sizeof(*sock));
+						sock->fd = fd;
+					}
+				}
+			}
+			tracee->pending_fake_netlink_socket = false;
+		}
+
+		/* Same for a NETLINK_ROUTE socket the host granted as is:
+		 * requests sent on it still need the ack emulation when
+		 * the tracee thinks it owns a network namespace.  */
+		if (tracee->pending_real_netlink_socket) {
+			int fd = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+			if (fd >= 0) {
+				int i;
+				if (tracee->netlink_route_fds_count < MAX_NETLINK_ROUTE_FDS) {
+					bool present = false;
+					for (i = 0; i < tracee->netlink_route_fds_count; i++) {
+						if (tracee->netlink_route_fds[i] == fd) {
 							present = true;
 							break;
 						}
 					}
 					if (!present)
-						tracee->fake_netlink_fds[tracee->fake_netlink_fds_count++] = fd;
+						tracee->netlink_route_fds[tracee->netlink_route_fds_count++] = fd;
 				}
 			}
-			tracee->pending_fake_netlink_socket = false;
+			tracee->pending_real_netlink_socket = false;
 		}
+		goto end;
+
+	case PR_recvfrom:
+	case PR_recvmsg:
+		/* Turn the kernel's refusal to reconfigure a network
+		 * namespace the tracee doesn't really have into an ack.  */
+		handle_netlink_reply_exit(tracee, syscall_number);
 		goto end;
 
 	default:
