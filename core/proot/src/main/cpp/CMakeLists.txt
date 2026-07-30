@@ -1,152 +1,77 @@
-cmake_minimum_required(VERSION 3.16)
-project(proot C)
+cmake_minimum_required(VERSION 3.13)
+project(proot C ASM)
 
-# ---------------------------------------------------------------------------
-# Paths / general setup
-# ---------------------------------------------------------------------------
-set(SRC ${CMAKE_CURRENT_SOURCE_DIR})
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-
-find_program(GIT_EXECUTABLE git REQUIRED)
-find_program(PYTHON_EXECUTABLE python3)
-find_program(SWIG_EXECUTABLE swig)
-find_program(OBJCOPY_EXECUTABLE objcopy REQUIRED)
-find_program(OBJDUMP_EXECUTABLE objdump REQUIRED)
-find_program(STRIP_EXECUTABLE strip REQUIRED)
+# ----------------------------------------------------------------------
+# Basic settings
+# ----------------------------------------------------------------------
 
 set(CMAKE_C_STANDARD 99)
-set(CMAKE_C_STANDARD_REQUIRED OFF)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ---------------------------------------------------------------------------
-# talloc: build directly from vendored source (no pkg-config, no subdirectory
-# CMakeLists.txt) since pkg-config can't find a cross-compiled talloc.pc
-# when building for Android.
-# ---------------------------------------------------------------------------
-add_library(talloc STATIC
-    ${SRC}/talloc/talloc.c
-    ${SRC}/talloc/replace.c
-    ${SRC}/talloc/closefrom.c
-)
-target_include_directories(talloc PUBLIC ${SRC}/talloc)
-target_compile_definitions(talloc PRIVATE HAVE_CONFIG_H)
+option(PROOT_WITH_LIBANDROID_SHMEM "Enable libandroid-shmem support" OFF)
+option(PROOT_UNBUNDLE_LOADER_PATH "Target directory to install the loader separately (empty = use bundled loader)" "")
 
-set(TALLOC_INCLUDE_DIRS ${SRC}/talloc)
-set(TALLOC_LIBRARIES talloc)
-set(TALLOC_CFLAGS_OTHER "")
+# This build targets arm64-v8a only. No cross-ABI / multi-triple support:
+# a single target triple is used for both the main build and the loader.
+set(MAIN_TARGET_TRIPLE "aarch64-none-linux-android26")
 
-include(FindPkgConfig)
-pkg_check_modules(LIBARCHIVE libarchive)   # only needed for the optional 'care' target
+if(NOT CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "gcc")
+endif()
 
-# ---------------------------------------------------------------------------
-# Common compiler / preprocessor flags (equivalent of CPPFLAGS/CFLAGS/LDFLAGS)
-# ---------------------------------------------------------------------------
+find_program(OBJCOPY_EXECUTABLE NAMES objcopy)
+find_program(OBJDUMP_EXECUTABLE NAMES objdump)
+find_program(STRIP_EXECUTABLE   NAMES strip)
+find_program(GIT_EXECUTABLE     NAMES git)
+find_program(READELF_EXECUTABLE NAMES readelf)
+
+set(SRC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ----------------------------------------------------------------------
+# Compiler flags
+# ----------------------------------------------------------------------
+
 add_compile_definitions(_FILE_OFFSET_BITS=64 _GNU_SOURCE)
-include_directories(
-    ${CMAKE_BINARY_DIR}
-    ${SRC}
-    ${SRC}/../lib/uthash/include
-    ${TALLOC_INCLUDE_DIRS}
-)
+include_directories(${CMAKE_CURRENT_BINARY_DIR} ${SRC})
 
-add_compile_options(-g -Wall -Wextra -O2 ${TALLOC_CFLAGS_OTHER})
+add_compile_options(-Wall -Wextra -O2)
 
-# -Wl,-z,noexecstack for every link
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,noexecstack")
-link_libraries(${TALLOC_LIBRARIES})
+if(PROOT_WITH_LIBANDROID_SHMEM)
+    add_compile_definitions(WITH_LIBANDROID_SHMEM)
+endif()
 
-# ---------------------------------------------------------------------------
-# Version string (GIT_VERSION-GIT_COMMIT), used by build.h
-# ---------------------------------------------------------------------------
-execute_process(
-    COMMAND ${GIT_EXECUTABLE} describe --tags
-    COMMAND_ERROR_IS_FATAL NONE
-    WORKING_DIRECTORY ${SRC}
-    OUTPUT_VARIABLE GIT_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-    COMMAND ${GIT_EXECUTABLE} rev-list --all --max-count=1
-    WORKING_DIRECTORY ${SRC}
-    OUTPUT_VARIABLE GIT_COMMIT_FULL
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-string(SUBSTRING "${GIT_COMMIT_FULL}" 0 8 GIT_COMMIT)
-set(PROOT_VERSION "${GIT_VERSION}-${GIT_COMMIT}")
+# ----------------------------------------------------------------------
+# Feature detection via arch.h (HAS_LOADER_32BIT / HAS_POKEDATA_WORKAROUND
+# / LOADER_ADDRESS / LOADER_ARCH_CFLAGS), resolved for the single
+# arm64-v8a target triple.
+# ----------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Optional python extension (needs swig + python*-config --embed)
-# ---------------------------------------------------------------------------
-set(HAVE_PYTHON_EXTENSION FALSE)
-if(SWIG_EXECUTABLE AND PYTHON_EXECUTABLE)
-    execute_process(
-        COMMAND ${PYTHON_EXECUTABLE}-config --includes
-        OUTPUT_VARIABLE PYTHON_CONFIG_INCLUDES
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE PYTHON_CONFIG_RESULT
-    )
-    if(PYTHON_CONFIG_RESULT EQUAL 0)
-        set(HAVE_PYTHON_EXTENSION TRUE)
-        execute_process(
-            COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.version_info.major)"
-            OUTPUT_VARIABLE PYTHON_MAJOR_VERSION
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        execute_process(
-            COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print('--embed' if sys.hexversion > 0x03080000 else '')"
-            OUTPUT_VARIABLE PYTHON_EMBED
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        execute_process(
-            COMMAND ${PYTHON_EXECUTABLE}-config --ldflags ${PYTHON_EMBED}
-            OUTPUT_VARIABLE PYTHON_CONFIG_LDFLAGS
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
+function(define_from_arch_h out_var macro_name target_triple)
+    if(target_triple)
+        set(_target_flag --target=${target_triple})
+    else()
+        set(_target_flag "")
     endif()
-endif()
+    execute_process(
+        COMMAND ${CMAKE_C_COMPILER} ${_target_flag} -E -dM -DNO_LIBC_HEADER ${SRC}/arch.h
+        OUTPUT_VARIABLE _arch_defs
+        ERROR_QUIET
+    )
+    string(REGEX MATCH "#define[ \t]+${macro_name}[ \t]+([^\n]*)" _match "${_arch_defs}")
+    if(_match)
+        set(${out_var} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+    else()
+        set(${out_var} "" PARENT_SCOPE)
+    endif()
+endfunction()
 
-# ---------------------------------------------------------------------------
-# Feature checks (process_vm, seccomp_filter) -> HAVE_PROCESS_VM / HAVE_SECCOMP_FILTER
-# ---------------------------------------------------------------------------
-include(CheckCSourceCompiles)
+define_from_arch_h(HAS_LOADER_32BIT "HAS_LOADER_32BIT" ${MAIN_TARGET_TRIPLE})
+define_from_arch_h(HAS_POKEDATA_WORKAROUND "HAS_POKEDATA_WORKAROUND" ${MAIN_TARGET_TRIPLE})
 
-check_c_source_compiles("
-#include <sys/uio.h>
-int main(void) {
-    struct iovec local, remote;
-    process_vm_readv(0, &local, 1, &remote, 1, 0);
-    return 0;
-}" HAVE_PROCESS_VM)
+# ----------------------------------------------------------------------
+# Source files
+# ----------------------------------------------------------------------
 
-check_c_source_compiles("
-#include <linux/seccomp.h>
-#ifndef SECCOMP_MODE_FILTER
-#error no seccomp filter
-#endif
-int main(void) { return 0; }" HAVE_SECCOMP_FILTER)
-
-# ---------------------------------------------------------------------------
-# build.h (auto-generated header, equivalent of the Makefile's build.h rule)
-# ---------------------------------------------------------------------------
-set(BUILD_H ${CMAKE_BINARY_DIR}/build.h)
-file(WRITE ${BUILD_H} "/* This file is auto-generated, edit at your own risk.  */\n")
-file(APPEND ${BUILD_H} "#ifndef BUILD_H\n#define BUILD_H\n")
-if(PROOT_VERSION)
-    file(APPEND ${BUILD_H} "#undef VERSION\n#define VERSION \"${PROOT_VERSION}\"\n")
-endif()
-if(HAVE_PYTHON_EXTENSION)
-    file(APPEND ${BUILD_H} "#define HAVE_PYTHON_EXTENSION\n")
-endif()
-if(HAVE_PROCESS_VM)
-    file(APPEND ${BUILD_H} "#define HAVE_PROCESS_VM\n")
-endif()
-if(HAVE_SECCOMP_FILTER)
-    file(APPEND ${BUILD_H} "#define HAVE_SECCOMP_FILTER\n")
-endif()
-file(APPEND ${BUILD_H} "#endif /* BUILD_H */\n")
-
-# ---------------------------------------------------------------------------
-# Core object sources
-# ---------------------------------------------------------------------------
 set(PROOT_SOURCES
     cli/cli.c
     cli/proot.c
@@ -161,6 +86,7 @@ set(PROOT_SOURCES
     path/binding.c
     path/glue.c
     path/canon.c
+    path/f2fs-bug.c
     path/path.c
     path/proc.c
     path/temp.c
@@ -173,127 +99,251 @@ set(PROOT_SOURCES
     syscall/socket.c
     syscall/heap.c
     syscall/rlimit.c
+    syscall/pipe_shadow.c
     tracee/tracee.c
     tracee/mem.c
     tracee/reg.c
     tracee/event.c
+    tracee/seccomp.c
+    tracee/statx.c
     ptrace/ptrace.c
     ptrace/user.c
     ptrace/wait.c
     extension/extension.c
+    extension/ashmem_memfd/ashmem_memfd.c
     extension/kompat/kompat.c
+    extension/fake_id0/chown.c
+    extension/fake_id0/chroot.c
+    extension/fake_id0/getsockopt.c
+    extension/fake_id0/sendmsg.c
+    extension/fake_id0/socket.c
+    extension/fake_id0/open.c
+    extension/fake_id0/unlink.c
+    extension/fake_id0/rename.c
+    extension/fake_id0/chmod.c
+    extension/fake_id0/utimensat.c
+    extension/fake_id0/access.c
+    extension/fake_id0/exec.c
+    extension/fake_id0/link.c
+    extension/fake_id0/symlink.c
+    extension/fake_id0/mk.c
+    extension/fake_id0/stat.c
+    extension/fake_id0/helper_functions.c
     extension/fake_id0/fake_id0.c
+    extension/hidden_files/hidden_files.c
+    extension/mountinfo/mountinfo.c
+    extension/port_switch/port_switch.c
+    extension/sysvipc/sysvipc.c
+    extension/sysvipc/sysvipc_msg.c
+    extension/sysvipc/sysvipc_sem.c
+    extension/sysvipc/sysvipc_shm.c
     extension/link2symlink/link2symlink.c
-    extension/portmap/portmap.c
-    extension/portmap/map.c
+    extension/fix_symlink_size/fix_symlink_size.c
 )
 
-if(HAVE_PYTHON_EXTENSION)
-    list(APPEND PROOT_SOURCES
-        extension/python/python.c
-        extension/python/python_extension.c
+list(TRANSFORM PROOT_SOURCES PREPEND "${SRC}/")
+
+# ----------------------------------------------------------------------
+# build.h generation (VERSION + HAVE_* feature macros)
+# ----------------------------------------------------------------------
+
+set(BUILD_H "${CMAKE_CURRENT_BINARY_DIR}/build.h")
+
+include(CheckCSourceCompiles)
+
+check_c_source_compiles("
+#include <sys/uio.h>
+int main(void){ struct iovec local, remote; process_vm_readv(0,&local,1,&remote,1,0); return 0; }
+" HAVE_PROCESS_VM)
+
+check_c_source_compiles("
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+int main(void){ return SECCOMP_MODE_FILTER; }
+" HAVE_SECCOMP_FILTER)
+
+if(GIT_EXECUTABLE)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --dirty --abbrev=8 --always
+        WORKING_DIRECTORY ${SRC}
+        OUTPUT_VARIABLE GIT_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
     )
 endif()
 
-set(CARE_SOURCES
-    cli/care.c
-    extension/care/care.c
-    extension/care/final.c
-    extension/care/extract.c
-    extension/care/archive.c
+file(WRITE ${BUILD_H} "/* This file is auto-generated, edit at your own risk.  */\n")
+file(APPEND ${BUILD_H} "#ifndef BUILD_H\n#define BUILD_H\n")
+if(GIT_VERSION)
+    file(APPEND ${BUILD_H} "#undef VERSION\n#define VERSION \"${GIT_VERSION}\"\n")
+endif()
+if(HAVE_PROCESS_VM)
+    file(APPEND ${BUILD_H} "#define HAVE_PROCESS_VM\n")
+endif()
+if(HAVE_SECCOMP_FILTER)
+    file(APPEND ${BUILD_H} "#define HAVE_SECCOMP_FILTER\n")
+endif()
+file(APPEND ${BUILD_H} "#endif /* BUILD_H */\n")
+
+# ----------------------------------------------------------------------
+# Bundled talloc library (built from source instead of relying on a
+# system -ltalloc, which is not available on Android/NDK sysroots)
+# ----------------------------------------------------------------------
+
+add_library(talloc STATIC
+    ${SRC}/talloc/talloc.c
+    ${SRC}/talloc/replace.c
+    ${SRC}/talloc/closefrom.c
 )
+target_compile_definitions(talloc PRIVATE HAVE_CONFIG_H __STDC_WANT_LIB_EXT1__=1)
+target_include_directories(talloc PRIVATE ${SRC}/talloc)
+target_include_directories(talloc INTERFACE ${SRC}/talloc)
+target_compile_options(talloc PRIVATE -w)
 
-# All hand-written sources depend on build.h being generated first.
-set_source_files_properties(${PROOT_SOURCES} ${CARE_SOURCES}
-    PROPERTIES OBJECT_DEPENDS ${BUILD_H})
+# ----------------------------------------------------------------------
+# Linker flags (build-id / rosegment feature tests)
+# ----------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Loader(s): a tiny freestanding static binary, later objcopy'd into a
-# regular .o and linked into proot/care as embedded data (see loader/loader.c).
-# Built per-arch: native, and 32-bit if the compiler can produce it (mirrors
-# HAS_LOADER_32BIT check against arch.h in the original Makefile).
-# ---------------------------------------------------------------------------
-function(build_proot_loader suffix extra_cflags)
-    set(loader_dir ${CMAKE_BINARY_DIR}/loader${suffix})
+set(LDFLAGS_COMMON -Wl,-z,noexecstack)
+if(PROOT_WITH_LIBANDROID_SHMEM)
+    list(APPEND LDFLAGS_COMMON -landroid-shmem)
+endif()
+
+execute_process(
+    COMMAND ${CMAKE_C_COMPILER} -xc - -Wl,--build-id=none -o /dev/null
+    INPUT_FILE /dev/null
+    RESULT_VARIABLE _build_id_none_result
+    OUTPUT_QUIET ERROR_QUIET
+)
+if(_build_id_none_result EQUAL 0)
+    set(BUILD_ID_NONE ",--build-id=none")
+endif()
+
+execute_process(
+    COMMAND ${CMAKE_C_COMPILER} -xc - -Wl,--rosegment -o /dev/null
+    INPUT_FILE /dev/null
+    RESULT_VARIABLE _rosegment_result
+    OUTPUT_QUIET ERROR_QUIET
+)
+if(_rosegment_result EQUAL 0)
+    set(ROSEGMENT ",--rosegment")
+endif()
+
+# ----------------------------------------------------------------------
+# Loader (loader.c + assembly.S -> embedded binary object)
+# Single arm64-v8a triple only, no companion 32-bit loader, no per-ABI
+# branching.
+# ----------------------------------------------------------------------
+
+function(build_loader)
+    set(loader_name "loader")
+    set(loader_dir "${CMAKE_CURRENT_BINARY_DIR}/loader")
     file(MAKE_DIRECTORY ${loader_dir})
 
-    set(loader_elf ${loader_dir}/loader${suffix})
-    set(loader_stripped ${loader_dir}/loader${suffix}.elf)
-    set(loader_obj ${CMAKE_BINARY_DIR}/loader${suffix}-wrapped.o)
+    define_from_arch_h(LOADER_ADDRESS_VAL "LOADER_ADDRESS" ${MAIN_TARGET_TRIPLE})
+    define_from_arch_h(LOADER_ARCH_CFLAGS_VAL "LOADER_ARCH_CFLAGS" ${MAIN_TARGET_TRIPLE})
 
-    add_custom_command(
-        OUTPUT ${loader_elf}
-        COMMAND ${CMAKE_C_COMPILER} ${extra_cflags} -fPIC -ffreestanding
-                -static -nostdlib -Wl,-Ttext=0x0,-z,noexecstack
-                -o ${loader_elf}
-                ${SRC}/loader/loader.c ${SRC}/loader/assembly.S
-        DEPENDS ${SRC}/loader/loader.c ${SRC}/loader/assembly.S ${SRC}/arch.h
-        COMMENT "Building freestanding loader${suffix}"
-        VERBATIM
+    if(NOT LOADER_ADDRESS_VAL)
+        message(FATAL_ERROR "build_loader: could not resolve LOADER_ADDRESS for triple '${MAIN_TARGET_TRIPLE}' (arch.h missing a branch for this target?)")
+    endif()
+
+    add_library(${loader_name}_objs OBJECT
+        ${SRC}/loader/loader.c
+        ${SRC}/loader/assembly.S
+    )
+    target_compile_options(${loader_name}_objs PRIVATE
+        --target=${MAIN_TARGET_TRIPLE} -fPIC -ffreestanding ${LOADER_ARCH_CFLAGS_VAL}
     )
 
+    add_executable(${loader_name} $<TARGET_OBJECTS:${loader_name}_objs>)
+    target_link_options(${loader_name} PRIVATE
+        --target=${MAIN_TARGET_TRIPLE} -static -nostdlib
+        -Wl${BUILD_ID_NONE},-Ttext=${LOADER_ADDRESS_VAL}${ROSEGMENT},-z,noexecstack
+    )
+    set_target_properties(${loader_name} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${loader_dir}
+    )
+
+    # loader binary -> stripped copy -> embed into an object file via objcopy
+    set(loader_stripped "${loader_dir}/${loader_name}.stripped")
     add_custom_command(
         OUTPUT ${loader_stripped}
-        COMMAND ${CMAKE_COMMAND} -E copy ${loader_elf} ${loader_stripped}
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:${loader_name}> ${loader_stripped}
         COMMAND ${STRIP_EXECUTABLE} ${loader_stripped}
-        DEPENDS ${loader_elf}
+        DEPENDS ${loader_name}
         VERBATIM
     )
 
+    set(loader_wrapped_obj "${loader_dir}/${loader_name}-wrapped.o")
     add_custom_command(
-        OUTPUT ${loader_obj}
+        OUTPUT ${loader_wrapped_obj}
         COMMAND ${OBJCOPY_EXECUTABLE}
-                --input-target binary
-                --output-target elf64-x86-64
-                --binary-architecture i386:x86-64
-                ${loader_stripped} ${loader_obj}
-        WORKING_DIRECTORY ${loader_dir}
+                --input-target=binary
+                --output-target=elf64-littleaarch64
+                --binary-architecture aarch64
+                ${loader_stripped} ${loader_wrapped_obj}
         DEPENDS ${loader_stripped}
-        COMMENT "Embedding loader${suffix} into object file"
+        COMMENT "GEN ${loader_name}-wrapped.o (embedded loader binary, ${MAIN_TARGET_TRIPLE})"
         VERBATIM
     )
 
-    set(LOADER_OBJ${suffix} ${loader_obj} PARENT_SCOPE)
+    set(loader_WRAPPED_OBJ ${loader_wrapped_obj} PARENT_SCOPE)
 endfunction()
 
-# NOTE: the --output-target/--binary-architecture pair should match the
-# host's actual object format; adjust if not targeting x86-64
-# (this mirrors the original Makefile's use of `objdump -f cli/cli.o`).
-build_proot_loader("" "")
-set(LOADER_OBJECTS ${LOADER_OBJ})
-
-# 32-bit loader is only built if the toolchain supports -m32 (equivalent of
-# checking HAS_LOADER_32BIT from arch.h); enable manually if needed:
-option(BUILD_LOADER_32BIT "Also build the 32-bit loader" OFF)
-if(BUILD_LOADER_32BIT)
-    build_proot_loader("-m32" "-m32")
-    list(APPEND LOADER_OBJECTS ${LOADER_OBJ-m32})
+if(NOT PROOT_UNBUNDLE_LOADER_PATH)
+    build_loader()
+    list(APPEND PROOT_EXTRA_OBJECTS ${loader_WRAPPED_OBJ})
 endif()
 
-# ---------------------------------------------------------------------------
-# proot
-# ---------------------------------------------------------------------------
-add_executable(proot ${PROOT_SOURCES} ${LOADER_OBJECTS})
-if(HAVE_PYTHON_EXTENSION)
-    target_include_directories(proot PRIVATE ${PYTHON_CONFIG_INCLUDES})
-    target_link_options(proot PRIVATE ${PYTHON_CONFIG_LDFLAGS})
+if(HAS_POKEDATA_WORKAROUND AND READELF_EXECUTABLE)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/loader/loader-info.c
+        COMMAND ${READELF_EXECUTABLE} -s $<TARGET_FILE:loader> |
+                awk -f ${SRC}/loader/loader-info.awk > ${CMAKE_CURRENT_BINARY_DIR}/loader/loader-info.c
+        DEPENDS loader
+        VERBATIM
+    )
+    list(APPEND PROOT_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/loader/loader-info.c)
 endif()
 
-# ---------------------------------------------------------------------------
-# care (optional; requires libarchive)
-# ---------------------------------------------------------------------------
-if(LIBARCHIVE_FOUND)
-    add_executable(care ${PROOT_SOURCES} ${CARE_SOURCES} ${LOADER_OBJECTS})
-    target_link_libraries(care PRIVATE ${LIBARCHIVE_LIBRARIES})
-    target_include_directories(care PRIVATE ${LIBARCHIVE_INCLUDE_DIRS})
-else()
-    message(STATUS "libarchive not found: 'care' target disabled")
+# ----------------------------------------------------------------------
+# Main target: proot
+# ----------------------------------------------------------------------
+
+add_executable(proot ${PROOT_SOURCES} ${PROOT_EXTRA_OBJECTS})
+target_link_libraries(proot PRIVATE talloc ${LDFLAGS_COMMON})
+
+if(PROOT_UNBUNDLE_LOADER_PATH)
+    target_compile_definitions(proot PRIVATE PROOT_UNBUNDLE_LOADER="${PROOT_UNBUNDLE_LOADER_PATH}")
 endif()
 
-# ---------------------------------------------------------------------------
+# Package the proot executable as libproot.so so Android's packaging
+# system (jniLibs) picks it up and extracts it with the correct
+# permissions at install time. It is still a normal ELF executable,
+# only the name/prefix/suffix mimic a shared library for packaging
+# purposes.
+set_target_properties(proot PROPERTIES
+    OUTPUT_NAME "proot"
+    PREFIX "lib"
+    SUFFIX ".so"
+)
+
+add_custom_command(
+    TARGET proot POST_BUILD
+    COMMAND ${STRIP_EXECUTABLE} --strip-unneeded $<TARGET_FILE:proot>
+    COMMENT "Stripping libproot.so"
+)
+
+# ----------------------------------------------------------------------
 # Install
-# ---------------------------------------------------------------------------
-install(TARGETS proot RUNTIME DESTINATION bin)
-if(TARGET care)
-    install(TARGETS care RUNTIME DESTINATION bin)
+# ----------------------------------------------------------------------
+
+include(GNUInstallDirs)
+install(TARGETS proot LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                       RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if(PROOT_UNBUNDLE_LOADER_PATH)
+    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/loader/loader
+            DESTINATION ${PROOT_UNBUNDLE_LOADER_PATH}
+            RENAME loader)
 endif()
