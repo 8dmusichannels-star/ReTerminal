@@ -196,14 +196,21 @@ val fontLauncher = rememberLauncherForActivityResult(ActivityResultContracts.Get
             try {
                 fontFile.createFileIfNot()
                 context.contentResolver.openInputStream(it)?.use { input ->
-                    fontFile.outputStream().use { output -> input.copyTo(output) }
-                } ?: throw IllegalStateException("openInputStream returned null")
+                    java.io.FileOutputStream(fontFile).use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                        output.fd.sync()
+                    }
+                } ?: throw IllegalStateException("Failed to open input stream for the selected file")
+
                 val name = context.getFileNameFromUri(it).toString()
                 Settings.custom_font_name = name
+                val typeface = Typeface.createFromFile(fontFile)
+
                 withContext(Dispatchers.Main) {
                     fontName = name
                     fontExists = true
-                    viewModel.setFont(Typeface.createFromFile(fontFile))
+                    viewModel.setFont(typeface)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
